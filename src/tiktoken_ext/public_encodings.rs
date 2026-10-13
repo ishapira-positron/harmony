@@ -731,11 +731,23 @@ mod tests {
 
         // Concurrent writers of the same destination each publish a complete
         // file, and a reader polling the destination meanwhile only ever
-        // finds no file or the whole of it.
+        // finds no file or the whole of it. The barrier has the reader
+        // polling before any writer starts, and the guard ends its polling
+        // even when a writer panics, so a writer error fails the test rather
+        // than leaving the scope waiting on the reader.
+        struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        const WRITERS: usize = 4;
         let large = b"rank data\n".repeat(1 << 18);
         let writing = std::sync::atomic::AtomicBool::new(true);
-        std::thread::scope(|scope| {
+        let start = std::sync::Barrier::new(WRITERS + 1);
+        let complete_reads = std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
+                start.wait();
                 let mut complete_reads = 0;
                 while writing.load(Ordering::Acquire) {
                     match std::fs::read(&destination) {
@@ -748,9 +760,11 @@ mod tests {
                 }
                 complete_reads
             });
-            let writers: Vec<_> = (0..4)
+            let stop = StopOnDrop(&writing);
+            let writers: Vec<_> = (0..WRITERS)
                 .map(|_| {
                     scope.spawn(|| {
+                        start.wait();
                         for _ in 0..8 {
                             write_file_atomically(&large[..], &destination, "test://vocab", None)
                                 .unwrap();
@@ -761,9 +775,10 @@ mod tests {
             for writer in writers {
                 writer.join().unwrap();
             }
-            writing.store(false, Ordering::Release);
-            reader.join().unwrap();
+            drop(stop);
+            reader.join().unwrap()
         });
+        assert!(complete_reads > 0, "the reader never saw a published file");
         assert_eq!(std::fs::read(&destination).unwrap(), large);
         assert_eq!(entries(&dir), vec!["vocab".to_string()]);
 
